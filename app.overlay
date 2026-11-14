@@ -1,0 +1,36 @@
+/*
+ * DeviceTree Overlay - nRF52840 BLE Sensor Monitor
+ *
+ * Habilita:
+ *   - Sensor de temperatura interna (TEMP peripheral)
+ *   - Canal ADC 0 do SAADC lendo VDD (tensao de alimentacao)
+ */
+
+/ {
+	zephyr,user {
+		io-channels = <&adc 0>;
+	};
+
+	aliases {
+		ambient-temp0 = &temp;
+	};
+};
+
+&temp {
+	status = "okay";
+};
+
+&adc {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <9>;  /* NRF_SAADC_VDD */
+		zephyr,resolution = <12>;
+	};
+};

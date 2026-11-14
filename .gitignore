@@ -1,0 +1,25 @@
+# Build
+build/
+twister-out*/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Editor
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+
+# Zephyr
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
