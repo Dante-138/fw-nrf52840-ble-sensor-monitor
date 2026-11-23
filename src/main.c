@@ -30,6 +30,7 @@ LOG_MODULE_REGISTER(sensor_monitor, LOG_LEVEL_INF);
 #define SENSOR_INTERVAL_MS     2000    /* Leitura de sensores a cada 2s   */
 #define LED_BLINK_MS           1000    /* Pisca LED1 a cada 1s            */
 #define TEMP_ALERT_HIGH        40.0f   /* Limiar de alerta de temperatura */
+#define BTN_DEBOUNCE_MS        50      /* Botao vale se segue apertado    */
 #define NOTIFY_STACK_SIZE      1024
 #define NOTIFY_PRIORITY        7
 
@@ -47,23 +48,14 @@ static const struct gpio_dt_spec led_ntf  = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpi
 static const struct gpio_dt_spec led_alrt = GPIO_DT_SPEC_GET(DT_ALIAS(led3), gpios);
 
 /* ================================================================== */
-/*  Botoes  (aliases do DeviceTree)                                    */
-/*  BTN1 = P0.11 -> leitura imediata                                   */
-/*  BTN2 = P0.12 -> liga/desliga notificacoes                          */
-/*  BTN3 = P0.24 -> reset min/max                                      */
-/*  BTN4 = P0.25 -> status completo via serial                         */
-/* ================================================================== */
-
-static const struct gpio_dt_spec btn1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
-static const struct gpio_dt_spec btn2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
-static const struct gpio_dt_spec btn3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
-static const struct gpio_dt_spec btn4 = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
-
-static struct gpio_callback btn_cb_data[4];
-
-/* ================================================================== */
 /*  Estado dos Sensores                                                */
 /* ================================================================== */
+
+/*
+ * A thread de notificacao, o main, o work dos botoes e as leituras GATT
+ * mexem neste estado: tudo passa por sensor_lock.
+ */
+K_MUTEX_DEFINE(sensor_lock);
 
 static float    current_temp;
 static float    temp_min =  999.0f;
@@ -74,11 +66,24 @@ static uint32_t reading_count;
 static bool     notify_active = true;
 static bool     ble_connected;
 
+/* Copia coerente do estado, para imprimir e notificar fora do lock. */
+struct snapshot {
+	float    temp;
+	float    temp_min;
+	float    temp_max;
+	int32_t  mv;
+	uint8_t  pct;
+	uint32_t count;
+};
+
 /* ================================================================== */
 /*  Sensor de Temperatura Interna                                      */
 /* ================================================================== */
 
-static const struct device *temp_dev;
+/* Resolvido em compilacao: a thread de notificacao sobe no boot, antes do
+ * main, e nunca le um ponteiro NULL. */
+static const struct device *const temp_dev =
+	DEVICE_DT_GET(DT_ALIAS(ambient_temp0));
 
 static int read_temperature(void)
 {
@@ -162,6 +167,30 @@ static int read_battery(void)
 	return 0;
 }
 
+/* Chamar com sensor_lock. */
+static void take_snapshot(struct snapshot *s)
+{
+	s->temp     = current_temp;
+	s->temp_min = temp_min;
+	s->temp_max = temp_max;
+	s->mv       = battery_mv;
+	s->pct      = battery_pct;
+	s->count    = reading_count;
+}
+
+/* Le temperatura e VDD e devolve o estado. Nao chamar de ISR (bloqueia). */
+static void read_sensors(struct snapshot *s, bool count_reading)
+{
+	k_mutex_lock(&sensor_lock, K_FOREVER);
+	read_temperature();
+	read_battery();
+	if (count_reading) {
+		reading_count++;
+	}
+	take_snapshot(s);
+	k_mutex_unlock(&sensor_lock);
+}
+
 /* ================================================================== */
 /*  BLE: Custom Sensor Service                                         */
 /* ================================================================== */
@@ -209,16 +238,28 @@ static ssize_t read_temp_char(struct bt_conn *conn,
 			      const struct bt_gatt_attr *attr,
 			      void *buf, uint16_t len, uint16_t offset)
 {
+	float temp;
+
+	k_mutex_lock(&sensor_lock, K_FOREVER);
+	temp = current_temp;
+	k_mutex_unlock(&sensor_lock);
+
 	return bt_gatt_attr_read(conn, attr, buf, len, offset,
-				 &current_temp, sizeof(current_temp));
+				 &temp, sizeof(temp));
 }
 
 static ssize_t read_batt_char(struct bt_conn *conn,
 			      const struct bt_gatt_attr *attr,
 			      void *buf, uint16_t len, uint16_t offset)
 {
+	uint8_t pct;
+
+	k_mutex_lock(&sensor_lock, K_FOREVER);
+	pct = battery_pct;
+	k_mutex_unlock(&sensor_lock);
+
 	return bt_gatt_attr_read(conn, attr, buf, len, offset,
-				 &battery_pct, sizeof(battery_pct));
+				 &pct, sizeof(pct));
 }
 
 /* --- Definicao do servico GATT ------------------------------------ */
@@ -303,48 +344,98 @@ static const struct bt_data sd[] = {
 };
 
 /* ================================================================== */
-/*  Botoes — handlers de interrupcao                                   */
+/*  Botoes  (aliases do DeviceTree)                                    */
+/*  BTN1 = P0.11 -> leitura imediata                                   */
+/*  BTN2 = P0.12 -> liga/desliga notificacoes                          */
+/*  BTN3 = P0.24 -> reset min/max                                      */
+/*  BTN4 = P0.25 -> status completo via serial                         */
+/*                                                                     */
+/*  A interrupcao so agenda um work. A acao roda no workqueue do       */
+/*  sistema, BTN_DEBOUNCE_MS depois da ultima borda, e so se o botao   */
+/*  continua apertado: o repique da mecanica vira uma acao so, e a     */
+/*  leitura de sensor (que bloqueia) sai do contexto de ISR.           */
 /* ================================================================== */
 
-static void btn1_handler(const struct device *dev, struct gpio_callback *cb,
-			 uint32_t pins)
+static void btn1_action(void)
 {
-	read_temperature();
-	read_battery();
+	struct snapshot s;
+
+	read_sensors(&s, false);
 	printk("[BTN1] Leitura forcada -> Temp: %.1f C | VDD: %d mV (%u%%)\n",
-	       (double)current_temp, battery_mv, battery_pct);
+	       (double)s.temp, s.mv, s.pct);
 }
 
-static void btn2_handler(const struct device *dev, struct gpio_callback *cb,
-			 uint32_t pins)
+static void btn2_action(void)
 {
 	notify_active = !notify_active;
 	printk("[BTN2] Notificacoes BLE: %s\n", notify_active ? "ON" : "OFF");
 }
 
-static void btn3_handler(const struct device *dev, struct gpio_callback *cb,
-			 uint32_t pins)
+static void btn3_action(void)
 {
+	float temp;
+
+	k_mutex_lock(&sensor_lock, K_FOREVER);
 	temp_min = current_temp;
 	temp_max = current_temp;
 	reading_count = 0;
-	printk("[BTN3] Min/Max resetados para %.1f C\n",
-	       (double)current_temp);
+	temp = current_temp;
+	k_mutex_unlock(&sensor_lock);
+
+	printk("[BTN3] Min/Max resetados para %.1f C\n", (double)temp);
 }
 
-static void btn4_handler(const struct device *dev, struct gpio_callback *cb,
-			 uint32_t pins)
+static void btn4_action(void)
 {
+	struct snapshot s;
+
+	k_mutex_lock(&sensor_lock, K_FOREVER);
+	take_snapshot(&s);
+	k_mutex_unlock(&sensor_lock);
+
 	printk("\n===== STATUS =====\n");
-	printk("Temp atual:    %.1f C\n", (double)current_temp);
-	printk("Temp min:      %.1f C\n", (double)temp_min);
-	printk("Temp max:      %.1f C\n", (double)temp_max);
-	printk("VDD:           %d mV (%u%%)\n", battery_mv, battery_pct);
-	printk("Leituras:      %u\n", reading_count);
+	printk("Temp atual:    %.1f C\n", (double)s.temp);
+	printk("Temp min:      %.1f C\n", (double)s.temp_min);
+	printk("Temp max:      %.1f C\n", (double)s.temp_max);
+	printk("VDD:           %d mV (%u%%)\n", s.mv, s.pct);
+	printk("Leituras:      %u\n", s.count);
 	printk("BLE:           %s\n",
 	       ble_connected ? "Conectado" : "Desconectado");
 	printk("Notificacoes:  %s\n", notify_active ? "ON" : "OFF");
 	printk("==================\n\n");
+}
+
+struct button {
+	struct gpio_dt_spec      spec;
+	void                   (*action)(void);
+	struct gpio_callback     cb;
+	struct k_work_delayable  work;
+};
+
+static struct button buttons[] = {
+	{ .spec = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios), .action = btn1_action },
+	{ .spec = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios), .action = btn2_action },
+	{ .spec = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios), .action = btn3_action },
+	{ .spec = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios), .action = btn4_action },
+};
+
+/* Contexto de ISR: so (re)agenda o work, que e seguro aqui. */
+static void btn_isr(const struct device *dev, struct gpio_callback *cb,
+		    uint32_t pins)
+{
+	struct button *b = CONTAINER_OF(cb, struct button, cb);
+
+	k_work_reschedule(&b->work, K_MSEC(BTN_DEBOUNCE_MS));
+}
+
+static void btn_work_fn(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct button *b = CONTAINER_OF(dwork, struct button, work);
+
+	if (gpio_pin_get_dt(&b->spec) == 1) {
+		b->action();
+	}
 }
 
 /* ================================================================== */
@@ -367,32 +458,39 @@ static int leds_init(void)
 	return 0;
 }
 
-typedef void (*btn_handler_t)(const struct device *,
-			      struct gpio_callback *, uint32_t);
-
 static int buttons_init(void)
 {
-	const struct gpio_dt_spec *btns[] = {&btn1, &btn2, &btn3, &btn4};
-	struct gpio_callback *cbs[] = {
-		&btn_cb_data[0], &btn_cb_data[1],
-		&btn_cb_data[2], &btn_cb_data[3]
-	};
-	btn_handler_t handlers[] = {
-		btn1_handler, btn2_handler,
-		btn3_handler, btn4_handler
-	};
+	for (size_t i = 0; i < ARRAY_SIZE(buttons); i++) {
+		struct button *b = &buttons[i];
+		int ret;
 
-	for (int i = 0; i < 4; i++) {
-		if (!gpio_is_ready_dt(btns[i])) {
-			LOG_ERR("BTN%d nao pronto", i + 1);
+		if (!gpio_is_ready_dt(&b->spec)) {
+			LOG_ERR("BTN%u nao pronto", (unsigned int)(i + 1));
 			return -ENODEV;
 		}
-		gpio_pin_configure_dt(btns[i], GPIO_INPUT);
-		gpio_pin_interrupt_configure_dt(btns[i],
-						GPIO_INT_EDGE_TO_ACTIVE);
-		gpio_init_callback(cbs[i], handlers[i],
-				   BIT(btns[i]->pin));
-		gpio_add_callback(btns[i]->port, cbs[i]);
+
+		ret = gpio_pin_configure_dt(&b->spec, GPIO_INPUT);
+		if (ret) {
+			LOG_ERR("BTN%u configure: %d", (unsigned int)(i + 1), ret);
+			return ret;
+		}
+
+		/* Work e callback prontos antes de ligar a interrupcao. */
+		k_work_init_delayable(&b->work, btn_work_fn);
+		gpio_init_callback(&b->cb, btn_isr, BIT(b->spec.pin));
+
+		ret = gpio_add_callback(b->spec.port, &b->cb);
+		if (ret) {
+			LOG_ERR("BTN%u callback: %d", (unsigned int)(i + 1), ret);
+			return ret;
+		}
+
+		ret = gpio_pin_interrupt_configure_dt(&b->spec,
+						      GPIO_INT_EDGE_TO_ACTIVE);
+		if (ret) {
+			LOG_ERR("BTN%u interrupt: %d", (unsigned int)(i + 1), ret);
+			return ret;
+		}
 	}
 	return 0;
 }
@@ -409,15 +507,14 @@ static void notify_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	while (1) {
+		struct snapshot s;
+
 		k_msleep(SENSOR_INTERVAL_MS);
 
-		read_temperature();
-		read_battery();
-		reading_count++;
+		read_sensors(&s, true);
 
 		LOG_INF("#%u | Temp: %.1f C | VDD: %d mV (%u%%)",
-			reading_count, (double)current_temp,
-			battery_mv, battery_pct);
+			s.count, (double)s.temp, s.mv, s.pct);
 
 		if (!ble_connected || !notify_active) {
 			continue;
@@ -426,8 +523,8 @@ static void notify_thread_fn(void *p1, void *p2, void *p3)
 		/* Notifica temperatura (attr index 2) */
 		int ret = bt_gatt_notify(cur_conn,
 					 &sensor_svc.attrs[2],
-					 &current_temp,
-					 sizeof(current_temp));
+					 &s.temp,
+					 sizeof(s.temp));
 		if (ret == 0) {
 			gpio_pin_set_dt(&led_ntf, 1);
 		}
@@ -435,8 +532,8 @@ static void notify_thread_fn(void *p1, void *p2, void *p3)
 		/* Notifica bateria (attr index 5) */
 		bt_gatt_notify(cur_conn,
 			       &sensor_svc.attrs[5],
-			       &battery_pct,
-			       sizeof(battery_pct));
+			       &s.pct,
+			       sizeof(s.pct));
 
 		/* Flash breve no LED3 */
 		k_msleep(100);
@@ -454,6 +551,7 @@ K_THREAD_DEFINE(notify_tid, NOTIFY_STACK_SIZE,
 
 int main(void)
 {
+	struct snapshot s;
 	int ret;
 
 	printk("\n");
@@ -468,13 +566,7 @@ int main(void)
 		return ret;
 	}
 
-	ret = buttons_init();
-	if (ret) {
-		return ret;
-	}
-
 	/* --- Sensor de temperatura --- */
-	temp_dev = DEVICE_DT_GET(DT_ALIAS(ambient_temp0));
 	if (!device_is_ready(temp_dev)) {
 		LOG_ERR("Sensor de temperatura nao encontrado");
 		return -ENODEV;
@@ -494,11 +586,16 @@ int main(void)
 	}
 	LOG_INF("ADC (VDD): OK");
 
+	/* Botoes so depois dos sensores: BTN1 le os dois. */
+	ret = buttons_init();
+	if (ret) {
+		return ret;
+	}
+
 	/* --- Leitura inicial --- */
-	read_temperature();
-	read_battery();
-	printk("Temperatura inicial: %.1f C\n", (double)current_temp);
-	printk("Tensao VDD:          %d mV\n\n", battery_mv);
+	read_sensors(&s, false);
+	printk("Temperatura inicial: %.1f C\n", (double)s.temp);
+	printk("Tensao VDD:          %d mV\n\n", s.mv);
 
 	/* --- Bluetooth --- */
 	ret = bt_enable(NULL);
