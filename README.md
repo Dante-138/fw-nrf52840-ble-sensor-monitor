@@ -73,7 +73,7 @@ BLE:
 2. Open the service `...def0` and enable notifications on the temperature and battery characteristics.
 3. The values update every 2 seconds.
 
-Buttons: BTN1 forces a reading, BTN2 pauses and resumes notifications, BTN3 resets min and max, BTN4 prints the status.
+Buttons: BTN1 forces a reading, BTN2 pauses and resumes notifications, BTN3 resets min and max, BTN4 prints the status. Each press counts once: the interrupt only schedules a work item, and the action runs in the system work queue 50 ms after the last edge, if the button is still pressed.
 
 ## License
 
